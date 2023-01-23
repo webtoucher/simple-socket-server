@@ -21,14 +21,14 @@ class Singleton(ABCMeta):
         return cls._instance
 
 
-class SocketServerException(socket.error):
+class SimpleSocketServerException(socket.error):
     """New class for socket.error."""
 
     def __init__(self, message, error):
         super().__init__(message, error)
 
 
-class SocketServer(object, metaclass=Singleton):
+class SimpleSocketServer(object, metaclass=Singleton):
     def __init__(self, ip='0.0.0.0', port=6666, max_conn=5):
         """Init socket class."""
         self.__ip = ip
@@ -119,7 +119,7 @@ class SocketServer(object, metaclass=Singleton):
         server_fd = self.server_socket.fileno()
         if server_fd < 0:
             self.__initialized = False
-            raise SocketServerException(
+            raise SimpleSocketServerException(
                 'Error with creating sockets',
                 'server_fd < 0',
             )

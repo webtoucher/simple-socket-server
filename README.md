@@ -1,22 +1,22 @@
 # Simple TCP socket server with select
 
 ![License](https://img.shields.io/badge/License-BSD%203--Clause-green)
-[![Downloads](https://img.shields.io/pypi/dm/socket-server.svg?color=orange)](https://pypi.python.org/pypi/socket-server)
-[![Latest Version](https://img.shields.io/pypi/v/socket-server.svg)](https://pypi.python.org/pypi/socket-server)
-[![Supported Python versions](https://img.shields.io/pypi/pyversions/socket-server.svg)](https://pypi.python.org/pypi/socket-server)
+[![Downloads](https://img.shields.io/pypi/dm/simple-socket-server.svg?color=orange)](https://pypi.python.org/pypi/simple-socket-server)
+[![Latest Version](https://img.shields.io/pypi/v/simple-socket-server.svg)](https://pypi.python.org/pypi/simple-socket-server)
+[![Supported Python versions](https://img.shields.io/pypi/pyversions/simple-socket-server.svg)](https://pypi.python.org/pypi/simple-socket-server)
 
 ## Installation
 
 Install it with pip:
 
 ```shell
-$ pip install socket-server
+$ pip install simple-socket-server
 ```
 
 Or you can add it as dependency in requirements.txt file of your python application:
 
 ```
-socket-server~=1.0
+simple-socket-server~=1.0
 ```
 
 ## Usage
@@ -25,9 +25,9 @@ Easy way to understand how it works is testing socket server via telnet terminal
 
 ```python
 from socket import socket
-from socket_server import SocketServer
+from simple_socket_server import SimpleSocketServer
 
-server = SocketServer(ip='0.0.0.0', port=5000)
+server = SimpleSocketServer(ip='0.0.0.0', port=5000)
 
 
 @server.on_connect

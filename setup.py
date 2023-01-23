@@ -1,8 +1,8 @@
 from setuptools import setup
 
-setup(name='socket-server',
+setup(name='simple-socket-server',
       version='1.0',
-      url='https://github.com/webtoucher/socket-server',
+      url='https://github.com/webtoucher/simple-socket-server',
       license='BSD-3-Clause',
       author='Alexey Kuznetsov',
       author_email='mirakuru@webtoucher.ru',
@@ -18,7 +18,7 @@ setup(name='socket-server',
           'Operating System :: Unix',
           'Operating System :: MacOS',
       ],
-      packages=['socket_server'],
+      packages=['simple_socket_server'],
       long_description=open('README.md').read(),
       long_description_content_type='text/markdown',
       zip_safe=False)
