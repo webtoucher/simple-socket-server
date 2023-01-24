@@ -12,7 +12,7 @@ import queue
 import time
 
 
-class Singleton(ABCMeta):
+class _Singleton(ABCMeta):
     """Metaclass for singleton."""
 
     def __call__(cls, *args, **kwargs):
@@ -28,12 +28,12 @@ class SimpleSocketServerException(socket.error):
         super().__init__(message, error)
 
 
-class SimpleSocketServer(object, metaclass=Singleton):
-    def __init__(self, ip='0.0.0.0', port=6666, max_conn=5):
+class SimpleSocketServer(object, metaclass=_Singleton):
+    def __init__(self):
         """Init socket class."""
-        self.__ip = ip
-        self.__port = port
-        self.__max_conn = max_conn
+        self.__ip = None
+        self.__port = None
+        self.__max_conn = None
         self.__inputs = []
         self.__outputs = []
         self.__messages = {}
@@ -44,7 +44,10 @@ class SimpleSocketServer(object, metaclass=Singleton):
         }
         self.__initialized = False
 
-    def run(self):
+    def run(self, ip='0.0.0.0', port=6666, max_conn=5):
+        self.__ip = ip
+        self.__port = port
+        self.__max_conn = max_conn
         self.__inputs = []
         self.__outputs = []
         self.__messages = {}
@@ -194,6 +197,11 @@ class SimpleSocketServer(object, metaclass=Singleton):
             self.__outputs.remove(sock)
         self.trigger('disconnect', sock)
         sock.close()
+
+
+class FlaskSimpleSocketServer(SimpleSocketServer, metaclass=_Singleton):
+    def __init__(self, app):
+        super(FlaskSimpleSocketServer, self).__init__()
 
 
 if __name__ == '__main__':

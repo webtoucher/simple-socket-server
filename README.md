@@ -27,27 +27,27 @@ Easy way to understand how it works is testing socket server via telnet terminal
 from socket import socket
 from simple_socket_server import SimpleSocketServer
 
-server = SimpleSocketServer(ip='0.0.0.0', port=5000)
+socket_server = SimpleSocketServer()
 
 
-@server.on_connect
+@socket_server.on_connect
 def on_connect(sock: socket):
-    print('Connected:', sock.getpeername())
-    server.send(sock, bytes('What is your name?\r\n', 'utf-8'))
+    print('New connection from %s:%s' % sock.getpeername())
+    socket_server.send(sock, bytes('What is your name?\r\n', 'utf-8'))
 
 
-@server.on_disconnect
+@socket_server.on_disconnect
 def on_disconnect(sock: socket):
-    print('Disconnected:', sock.getpeername())
+    print('Connection from %s:%s is closed' % sock.getpeername())
 
 
-@server.on_message
+@socket_server.on_message
 def on_message(sock: socket, message: bytes):
-    print('Incoming data', sock.getpeername(), message)
-    server.send(sock, bytes('Hi, ', 'utf-8') + message)
+    print('Incoming data from %s:%s' % sock.getpeername(), message)
+    socket_server.send(sock, bytes('Hi, ', 'utf-8') + message)
 
 
-server.run()
+socket_server.run(ip='0.0.0.0', port=5000)
 
 ```
 
@@ -55,4 +55,44 @@ Then you can connect to server:
 
 ```shell
 telnet 127.0.0.1 5000
+```
+
+This socket server can be used with the Flask server:
+
+```python
+import logging
+from flask import Flask
+from socket import socket
+from simple_socket_server import FlaskSimpleSocketServer
+
+app = Flask(__name__)
+app.logger.setLevel(logging.DEBUG)
+socket_server = FlaskSimpleSocketServer(app)
+
+
+@app.route('/', methods=['GET'])
+def get_index():
+    """ Yor index page code """
+
+
+@socket_server.on_connect
+def on_connect(sock: socket):
+    app.logger.info('New connection from %s:%s' % sock.getpeername())
+    socket_server.send(sock, bytes('What is your name?\r\n', 'utf-8'))
+
+
+@socket_server.on_disconnect
+def on_disconnect(sock: socket):
+    app.logger.info('Connection from %s:%s is closed' % sock.getpeername())
+
+
+@socket_server.on_message
+def on_message(sock: socket, message: bytes):
+    app.logger.debug('Incoming data from %s:%s' % sock.getpeername())
+    answer = your_message_handler(message)
+    socket_server.send(sock, answer)
+
+
+socket_server.run(ip='0.0.0.0', port=5000)
+
 ```
