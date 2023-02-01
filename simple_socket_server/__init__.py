@@ -38,6 +38,7 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         self.__outputs = []
         self.__messages = {}
         self.__listeners = {
+            'start': [],
             'connect': [],
             'disconnect': [],
             'message': [],
@@ -66,6 +67,14 @@ class SimpleSocketServer(object, metaclass=_Singleton):
                 time.sleep(0.1)
             else:
                 self.__initialize()
+
+    @property
+    def on_start(self):
+        def decorator(func):
+            self.add_listener('start', func)
+            return func
+
+        return decorator
 
     @property
     def on_connect(self):
@@ -136,6 +145,7 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         self.server_socket.listen(self.__max_conn)
         self.__inputs.append(self.server_socket)
         self.__initialized = True
+        self.trigger('start', self.__ip, self.__port)
 
     def __read_socket(self, sockets_to_read: list):
         for sock in sockets_to_read:
