@@ -165,11 +165,9 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         data_from_client = None
         try:
             data_from_client = sock.recv(1024)
+            if data_from_client:
+                self.trigger('message', sock, data_from_client)
         except ConnectionResetError:
-            self.__delete_socket_connection(sock)
-        if data_from_client:
-            self.trigger('message', sock, data_from_client)
-        else:
             self.__delete_socket_connection(sock)
 
     def __write_socket(self, socket_to_write):

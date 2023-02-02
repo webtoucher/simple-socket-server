@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='simple-socket-server',
-      version='1.2',
+      version='1.3',
       url='https://github.com/webtoucher/simple-socket-server',
       license='BSD-3-Clause',
       author='Alexey Kuznetsov',
