@@ -31,7 +31,7 @@ class SimpleSocketServerException(socket.error):
 class SimpleSocketServer(object, metaclass=_Singleton):
     def __init__(self):
         """Init socket class."""
-        self.__ip = None
+        self.__host = None
         self.__port = None
         self.__max_conn = None
         self.__inputs = []
@@ -45,8 +45,8 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         }
         self.__initialized = False
 
-    def run(self, ip='0.0.0.0', port=6666, max_conn=5):
-        self.__ip = ip
+    def run(self, host='0.0.0.0', port=6666, max_conn=5):
+        self.__host = host
         self.__port = port
         self.__max_conn = max_conn
         self.__inputs = []
@@ -141,11 +141,11 @@ class SimpleSocketServer(object, metaclass=_Singleton):
             socket.SO_REUSEADDR,
             1,
         )
-        self.server_socket.bind((self.__ip, self.__port))
+        self.server_socket.bind((self.__host, self.__port))
         self.server_socket.listen(self.__max_conn)
         self.__inputs.append(self.server_socket)
         self.__initialized = True
-        self.trigger('start', self.__ip, self.__port)
+        self.trigger('start', self.__host, self.__port)
 
     def __read_socket(self, sockets_to_read: list):
         for sock in sockets_to_read:
@@ -207,11 +207,6 @@ class SimpleSocketServer(object, metaclass=_Singleton):
             self.__outputs.remove(sock)
         self.trigger('disconnect', sock)
         sock.close()
-
-
-class FlaskSimpleSocketServer(SimpleSocketServer, metaclass=_Singleton):
-    def __init__(self, app):
-        super(FlaskSimpleSocketServer, self).__init__()
 
 
 if __name__ == '__main__':
