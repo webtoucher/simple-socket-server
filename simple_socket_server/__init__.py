@@ -184,6 +184,9 @@ class SimpleSocketServer(object, metaclass=_Singleton):
             try:
                 if echo_message:
                     sock.send(echo_message)
+            except BrokenPipeError as err:
+                self.trigger('error', sock, err)
+                pass
             except ConnectionResetError:
                 self.__delete_socket_connection(sock)
 

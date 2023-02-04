@@ -16,7 +16,7 @@ $ pip install simple-socket-server
 Or you can add it as dependency in requirements.txt file of your python application:
 
 ```
-simple-socket-server~=1.3
+simple-socket-server~=1.4
 ```
 
 ## Usage
