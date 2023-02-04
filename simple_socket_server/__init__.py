@@ -5,11 +5,13 @@ Copyright (c) 2023 webtoucher
 Distributed under the BSD 3-Clause license. See LICENSE for more info.
 """
 
-from abc import ABCMeta
-import socket
-import select
 import queue
+import select
+import socket
 import time
+
+from abc import ABCMeta
+from eventemitter import EventEmitter
 
 
 class _Singleton(ABCMeta):
@@ -28,7 +30,7 @@ class SimpleSocketServerException(socket.error):
         super().__init__(message, error)
 
 
-class SimpleSocketServer(object, metaclass=_Singleton):
+class SimpleSocketServer(EventEmitter, metaclass=_Singleton):
     def __init__(self):
         """Init socket class."""
         self.__host = None
@@ -37,12 +39,6 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         self.__inputs = []
         self.__outputs = []
         self.__messages = {}
-        self.__listeners = {
-            'start': [],
-            'connect': [],
-            'disconnect': [],
-            'message': [],
-        }
         self.__initialized = False
 
     def run(self, host='0.0.0.0', port=6666, max_conn=5):
@@ -67,54 +63,6 @@ class SimpleSocketServer(object, metaclass=_Singleton):
                 time.sleep(0.1)
             else:
                 self.__initialize()
-
-    @property
-    def on_start(self):
-        def decorator(func):
-            self.add_listener('start', func)
-            return func
-
-        return decorator
-
-    @property
-    def on_connect(self):
-        def decorator(func):
-            self.add_listener('connect', func)
-            return func
-
-        return decorator
-
-    @property
-    def on_disconnect(self):
-        def decorator(func):
-            self.add_listener('disconnect', func)
-            return func
-
-        return decorator
-
-    @property
-    def on_message(self):
-        def decorator(func):
-            self.add_listener('message', func)
-            return func
-
-        return decorator
-
-    def add_listener(self, name, func):
-        if not self.__listeners[name]:
-            self.__listeners.update({name: []})
-        if func not in self.__listeners[name]:
-            self.__listeners[name].append(func)
-
-    def remove_listener(self, name, func):
-        if self.__listeners[name] and func in self.__listeners[name]:
-            self.__listeners[name].remove(func)
-
-    def trigger(self, name, *args):
-        if not self.__listeners[name]:
-            return
-        for func in self.__listeners[name]:
-            func(*args)
 
     def send(self, sock, message):
         if self.__messages[sock]:
@@ -145,7 +93,7 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         self.server_socket.listen(self.__max_conn)
         self.__inputs.append(self.server_socket)
         self.__initialized = True
-        self.trigger('start', self.__host, self.__port)
+        self.emit('start', self.__host, self.__port)
 
     def __read_socket(self, sockets_to_read: list):
         for sock in sockets_to_read:
@@ -159,14 +107,14 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         client_socket.setblocking(0)
         self.__inputs.append(client_socket)
         self.__messages[client_socket] = queue.Queue()
-        self.trigger('connect', client_socket)
+        self.emit('connect', client_socket)
 
     def __receive_message(self, sock):
         data_from_client = None
         try:
             data_from_client = sock.recv(1024)
             if data_from_client:
-                self.trigger('message', sock, data_from_client)
+                self.emit('message', sock, data_from_client)
         except ConnectionResetError:
             self.__delete_socket_connection(sock)
 
@@ -185,7 +133,7 @@ class SimpleSocketServer(object, metaclass=_Singleton):
                 if echo_message:
                     sock.send(echo_message)
             except BrokenPipeError as err:
-                self.trigger('error', sock, err)
+                self.emit('error', sock, err)
                 pass
             except ConnectionResetError:
                 self.__delete_socket_connection(sock)
@@ -206,7 +154,7 @@ class SimpleSocketServer(object, metaclass=_Singleton):
         self.__messages.pop(sock, None)
         if sock in self.__outputs:
             self.__outputs.remove(sock)
-        self.trigger('disconnect', sock)
+        self.emit('disconnect', sock)
         sock.close()
 
 
