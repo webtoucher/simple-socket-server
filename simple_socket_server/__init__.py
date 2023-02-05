@@ -24,15 +24,13 @@ class _Singleton(ABCMeta):
 
 
 class SimpleSocketServerException(socket.error):
-    """New class for socket.error."""
-
     def __init__(self, message, error):
         super().__init__(message, error)
 
 
 class SimpleSocketServer(EventBus, metaclass=_Singleton):
     def __init__(self):
-        """Init socket class."""
+        super().__init__()
         self.__host = None
         self.__port = None
         self.__max_conn = None
