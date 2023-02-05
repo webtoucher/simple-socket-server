@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='simple-socket-server',
-      version='1.5',
+      version='1.6',
       url='https://github.com/webtoucher/simple-socket-server',
       license='BSD-3-Clause',
       author='Alexey Kuznetsov',
@@ -21,4 +21,7 @@ setup(name='simple-socket-server',
       packages=['simple_socket_server'],
       long_description=open('README.md').read(),
       long_description_content_type='text/markdown',
+      install_requires=[
+          'event-bus~=1.0.2',
+      ],
       zip_safe=False)

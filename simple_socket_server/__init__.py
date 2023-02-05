@@ -11,7 +11,7 @@ import socket
 import time
 
 from abc import ABCMeta
-from eventemitter import EventEmitter
+from event_bus import EventBus
 
 
 class _Singleton(ABCMeta):
@@ -30,7 +30,7 @@ class SimpleSocketServerException(socket.error):
         super().__init__(message, error)
 
 
-class SimpleSocketServer(EventEmitter, metaclass=_Singleton):
+class SimpleSocketServer(EventBus, metaclass=_Singleton):
     def __init__(self):
         """Init socket class."""
         self.__host = None
