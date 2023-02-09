@@ -37,6 +37,7 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
         self.__inputs = []
         self.__outputs = []
         self.__messages = {}
+        self.__clients = {}
         self.__initialized = False
 
     def run(self, host='0.0.0.0', port=6666, max_conn=5):
@@ -46,6 +47,7 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
         self.__inputs = []
         self.__outputs = []
         self.__messages = {}
+        self.__clients = {}
         """Run socket server."""
         while True:
             if self.__initialized:
@@ -102,17 +104,17 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
 
     def __server_socket(self, server_socket):
         client_socket, client_address = server_socket.accept()
+        self.__clients[client_socket] = client_address
         client_socket.setblocking(0)
         self.__inputs.append(client_socket)
         self.__messages[client_socket] = queue.Queue()
-        self.emit('connect', client_socket)
+        self.emit('connect', client_socket, client_address)
 
     def __receive_message(self, sock):
-        data_from_client = None
         try:
             data_from_client = sock.recv(1024)
             if data_from_client:
-                self.emit('message', sock, data_from_client)
+                self.emit('message', sock, self.__clients[sock], data_from_client)
         except ConnectionResetError:
             self.__delete_socket_connection(sock)
 
@@ -131,7 +133,7 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
                 if echo_message:
                     sock.send(echo_message)
             except BrokenPipeError as err:
-                self.emit('error', sock, err)
+                self.emit('error', sock, self.__clients[sock], err)
                 pass
             except ConnectionResetError:
                 self.__delete_socket_connection(sock)
@@ -144,6 +146,7 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
                 self.__inputs = []
                 self.__outputs = []
                 self.__messages = {}
+                self.__clients = {}
                 self.__initialized = False
 
     def __delete_socket_connection(self, sock):
@@ -152,7 +155,7 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
         self.__messages.pop(sock, None)
         if sock in self.__outputs:
             self.__outputs.remove(sock)
-        self.emit('disconnect', sock)
+        self.emit('disconnect', sock, self.__clients[sock])
         sock.close()
 
 

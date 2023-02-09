@@ -16,7 +16,7 @@ $ pip install simple-socket-server
 Or you can add it as dependency in requirements.txt file of your python application:
 
 ```
-simple-socket-server~=1.7
+simple-socket-server~=1.8
 ```
 
 ## Usage
@@ -31,19 +31,19 @@ socket_server = SimpleSocketServer()
 
 
 @socket_server.on('connect')
-def on_connect(sock: socket):
-    print('New connection from %s:%s' % sock.getpeername())
+def on_connect(sock: socket, peer):
+    print('New connection from %s:%s' % peer)
     socket_server.send(sock, bytes('What is your name?\r\n', 'utf-8'))
 
 
 @socket_server.on('disconnect')
-def on_disconnect(sock: socket):
-    print('Connection from %s:%s is closed' % sock.getpeername())
+def on_disconnect(_sock, peer):
+    print('Connection from %s:%s is closed' % peer)
 
 
 @socket_server.on('message')
-def on_message(sock: socket, message: bytes):
-    print('Incoming data from %s:%s' % sock.getpeername(), message)
+def on_message(sock: socket, peer, message: bytes):
+    print('Incoming data from %s:%s' % peer, message)
     socket_server.send(sock, bytes('Hi, ', 'utf-8') + message)
 
 
