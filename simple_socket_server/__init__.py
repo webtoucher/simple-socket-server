@@ -10,25 +10,13 @@ import select
 import socket
 import time
 
-from abc import ABCMeta
 from event_bus import EventBus
-
-
-class _Singleton(ABCMeta):
-    """Metaclass for singleton."""
-
-    def __call__(cls, *args, **kwargs):
-        if not hasattr(cls, '_instance'):
-            cls._instance = super().__call__(*args, **kwargs)
-        return cls._instance
-
 
 class SimpleSocketServerException(socket.error):
     def __init__(self, message, error):
         super().__init__(message, error)
 
-
-class SimpleSocketServer(EventBus, metaclass=_Singleton):
+class SimpleSocketServer(EventBus):
     def __init__(self):
         super().__init__()
         self.__host = None
@@ -65,7 +53,13 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
                 self.__initialize()
 
     def send(self, sock, message):
-        if self.__messages[sock]:
+        if sock in self.__messages:
+            self.__messages[sock].put(message)
+            if sock not in self.__outputs:
+                self.__outputs.append(sock)
+
+    def sendall(self, message):
+        for sock in self.__messages:
             self.__messages[sock].put(message)
             if sock not in self.__outputs:
                 self.__outputs.append(sock)
@@ -161,3 +155,4 @@ class SimpleSocketServer(EventBus, metaclass=_Singleton):
 
 if __name__ == '__main__':
     pass
+    
