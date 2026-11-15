@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -21,7 +22,7 @@ from event_bus import EventBus
 
 __all__ = ["SimpleSocketServer", "SimpleSocketServerException"]
 
-__version__ = "2.1"
+__version__ = "2.2.0"
 
 #: Peer address as returned by accept(): (host, port).
 Address = Tuple[str, int]
@@ -36,6 +37,11 @@ _POLL_INTERVAL = 0.1
 #: FD_SETSIZE by raising ValueError, and that limit is 512 on Windows and
 #: 1024 elsewhere, so the default stays below both.
 _DEFAULT_MAX_CLIENTS = 500
+
+#: Highest descriptor number that select() accepts on POSIX systems: a socket
+#: above it fails the poll with ValueError. Windows limits the number of
+#: descriptors instead of their numbers, and max_clients covers that case.
+_SELECT_FD_LIMIT: Optional[int] = None if sys.platform == "win32" else 1024
 
 
 class SimpleSocketServerException(socket.error):
@@ -62,24 +68,35 @@ class SimpleSocketServer(EventBus):
     ``stop(host, port)``
         run() has returned and every socket is closed.
 
-    Handlers are called from the thread that runs run(), one at a time, so a
-    slow handler delays every other connection. **Handlers must not raise**: an
-    exception propagates out of run() and stops the server for every client.
+    Handlers are always called from the thread that runs run(), one at a time,
+    so a slow handler delays every other connection. **Handlers must not raise**:
+    an exception propagates out of run() and stops the server for every client.
     The sockets are still closed before run() returns.
+
+    send() and disconnect() may be called from any thread: the structures they
+    touch are guarded by a lock, and the sockets are closed only by the thread
+    that runs run(), so no handler ever runs outside it.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.__host = "0.0.0.0"
         self.__port = 6666
-        self.__max_conn = 5
+        self.__max_conn = socket.SOMAXCONN
         self.__max_clients = _DEFAULT_MAX_CLIENTS
+        self.__max_pending: Optional[int] = None
         self.__server_socket: Optional[socket.socket] = None
         self.__inputs: List[socket.socket] = []
         self.__outputs: List[socket.socket] = []
         self.__pending: Dict[socket.socket, bytearray] = {}
         self.__clients: Dict[socket.socket, Address] = {}
         self.__closing: Set[socket.socket] = set()
+        self.__deadlines: Dict[socket.socket, float] = {}
+        self.__failures: Dict[socket.socket, BaseException] = {}
+        #: Sockets the server has closed already, so disconnect() stays quiet for
+        #: them. Weak references keep this from pinning dead sockets.
+        self.__retired: "weakref.WeakSet[socket.socket]" = weakref.WeakSet()
+        self.__runner: Optional[int] = None
         self.__lock = threading.Lock()
         self.__stop = threading.Event()
 
@@ -102,8 +119,9 @@ class SimpleSocketServer(EventBus):
         self,
         host: str = "0.0.0.0",
         port: int = 6666,
-        max_conn: int = 5,
+        max_conn: int = socket.SOMAXCONN,
         max_clients: int = _DEFAULT_MAX_CLIENTS,
+        max_pending: Optional[int] = None,
     ) -> None:
         """Serve connections until stop() is called.
 
@@ -113,9 +131,15 @@ class SimpleSocketServer(EventBus):
         event and by the host and port properties.
 
         max_conn is the backlog of the listening socket: how many connections the
-        system may queue before accept(). max_clients is the number of clients
-        the server keeps at once; a connection above it is accepted and closed
-        immediately with an error event.
+        system may queue before accept(). It defaults to socket.SOMAXCONN.
+
+        max_clients is the number of clients the server keeps at once; a
+        connection above it is accepted and closed immediately with an error
+        event.
+
+        max_pending caps the outbound queue of one client, in bytes. When a
+        client stops reading and its queue grows past the cap, the server
+        reports error on it and closes it. None means no cap.
         """
         if self.is_running:
             raise RuntimeError("the server is already running")
@@ -123,13 +147,18 @@ class SimpleSocketServer(EventBus):
         self.__port = port
         self.__max_conn = max_conn
         self.__max_clients = max_clients
+        self.__max_pending = max_pending
         self.__stop.clear()
         self.__initialize()
+        self.__runner = threading.get_ident()
         try:
             while not self.__stop.is_set():
                 self.__select()
         finally:
-            self.__shutdown()
+            try:
+                self.__shutdown()
+            finally:
+                self.__runner = None
 
     def stop(self) -> None:
         """Ask run() to return.
@@ -147,9 +176,12 @@ class SimpleSocketServer(EventBus):
         tail is retried on the next poll; a message larger than the socket
         buffer is delivered in full. Empty messages are ignored.
 
-        Safe to call from another thread: delivery happens during the next poll,
-        so it may take up to the poll interval. The queue has no size limit, so
-        a slow reader grows the buffer until it is disconnected.
+        Safe to call from another thread. An empty queue is written straight to
+        the socket, so a reply from another thread does not wait for the next
+        poll; whatever the socket does not take at once is queued.
+
+        When max_pending is set and the queue of a client grows past it, the
+        server reports error on that client and drops the queue.
         """
         if not message:
             return
@@ -157,21 +189,63 @@ class SimpleSocketServer(EventBus):
             pending = self.__pending.get(sock)
             if pending is None:
                 raise ValueError("the socket is not a client of this server")
-            pending.extend(message)
-            if sock not in self.__outputs:
-                self.__outputs.append(sock)
+            failure: Optional[BaseException] = None
+            sent = 0
+            if not pending:
+                try:
+                    sent = sock.send(message)
+                except BlockingIOError:
+                    sent = 0
+                except OSError as error:
+                    # Reported by the poll thread: handlers run only there.
+                    failure = error
+            if sent < len(message):
+                pending.extend(message[sent:])
+                if sock not in self.__outputs:
+                    self.__outputs.append(sock)
+            if (
+                failure is None
+                and self.__max_pending is not None
+                and len(pending) > self.__max_pending
+            ):
+                failure = ConnectionAbortedError(
+                    "the outbound queue is over %d bytes" % self.__max_pending
+                )
+            if failure is not None:
+                self.__failures[sock] = failure
 
-    def disconnect(self, sock: socket.socket) -> None:
+    def disconnect(
+        self,
+        sock: socket.socket,
+        timeout: Optional[float] = None,
+    ) -> None:
         """Close a client connection gracefully.
 
         The socket stops being read, the replies already queued for it are
         delivered first, and only then it is closed and the disconnect event is
-        emitted. Safe to call from an event handler or from another thread.
+        emitted. Safe to call from an event handler or from another thread: the
+        socket is closed by the thread of run(), never by the caller.
+
+        timeout is how long the queue may still be flushed, in seconds. When it
+        expires, the socket is closed with whatever is left unsent, so a client
+        that stopped reading does not keep the connection forever. None waits
+        for the queue without a limit.
+
+        Calling it again for a client that is closed already does nothing, so a
+        race with the peer is harmless; a socket the server never served raises
+        ValueError.
 
         Use it instead of sock.close(): closing a socket behind the server's
         back leaves the select() set with a dead descriptor.
         """
-        self.__start_closing(sock, strict=True)
+        with self.__lock:
+            known = sock in self.__clients
+            retired = sock in self.__retired
+        if not known:
+            if retired:
+                return
+            raise ValueError("the socket is not a client of this server")
+        self.__start_closing(sock, timeout)
 
     def __initialize(self) -> None:
         server_socket = socket.socket(
@@ -179,6 +253,13 @@ class SimpleSocketServer(EventBus):
             socket.SOCK_STREAM,
             socket.IPPROTO_TCP,
         )
+        descriptor = server_socket.fileno()
+        if _SELECT_FD_LIMIT is not None and descriptor >= _SELECT_FD_LIMIT:
+            server_socket.close()
+            raise SimpleSocketServerException(
+                "cannot poll descriptor %d: select() accepts numbers below %d"
+                % (descriptor, _SELECT_FD_LIMIT)
+            )
         try:
             server_socket.setblocking(False)
             server_socket.setsockopt(
@@ -200,7 +281,7 @@ class SimpleSocketServer(EventBus):
         self.emit("start", self.__host, self.__port)
 
     def __select(self) -> None:
-        self.__prune()
+        self.__settle()
         # Handlers may call disconnect() and send() from another thread, so the
         # sequences handed to select() are snapshots taken under the lock.
         with self.__lock:
@@ -234,11 +315,36 @@ class SimpleSocketServer(EventBus):
         for sock in sock_to_write:
             self.__flush(sock)
 
-    def __prune(self) -> None:
-        """Drop sockets that the application closed behind the server's back."""
+    def __settle(self) -> None:
+        """Finish the work queued by other threads before the poll."""
         for sock in list(self.__clients):
             if sock.fileno() < 0:
+                # The application closed it behind the server's back.
                 self.__close(sock)
+        with self.__lock:
+            drained = [
+                sock
+                for sock in self.__closing
+                if sock in self.__clients and not self.__pending.get(sock)
+            ]
+            now = time.monotonic()
+            expired = [
+                sock
+                for sock, deadline in self.__deadlines.items()
+                if deadline <= now and sock in self.__clients
+            ]
+            failures = list(self.__failures.items())
+            self.__failures.clear()
+        for sock in drained:
+            self.__close(sock)
+        for sock in expired:
+            # The peer did not read its replies in time: drop the rest.
+            self.__close(sock)
+        for sock, failure in failures:
+            if sock not in self.__clients:
+                continue
+            self.emit("error", sock, self.__clients.get(sock), failure)
+            self.__close(sock)
 
     def __accept(self) -> None:
         server_socket = self.__server_socket
@@ -255,6 +361,18 @@ class SimpleSocketServer(EventBus):
             time.sleep(_POLL_INTERVAL)
             return
         client_socket.setblocking(False)
+        if _SELECT_FD_LIMIT is not None and client_socket.fileno() >= _SELECT_FD_LIMIT:
+            # select() fails on the descriptor number, not on the count.
+            client_socket.close()
+            self.emit(
+                "error",
+                client_socket,
+                client_address,
+                ConnectionAbortedError(
+                    "the descriptor number is too large for select()"
+                ),
+            )
+            return
         if len(self.__clients) >= self.__max_clients:
             client_socket.close()
             self.emit(
@@ -271,9 +389,11 @@ class SimpleSocketServer(EventBus):
         self.emit("connect", client_socket, client_address)
 
     def __receive(self, sock: socket.socket) -> None:
-        peer = self.__clients.get(sock)
-        if peer is None:
-            # The socket was already dropped during this poll.
+        with self.__lock:
+            peer = self.__clients.get(sock)
+            closing = sock in self.__closing
+        if peer is None or closing:
+            # Dropped during this poll, or closing: nothing more to read.
             return
         try:
             data = sock.recv(_RECV_SIZE)
@@ -294,21 +414,32 @@ class SimpleSocketServer(EventBus):
             return
         self.emit("message", sock, peer, data)
 
-    def __start_closing(self, sock: socket.socket, strict: bool = False) -> None:
+    def __start_closing(
+        self,
+        sock: socket.socket,
+        timeout: Optional[float] = None,
+    ) -> None:
         """Stop reading a connection and close it once its queue is drained."""
         with self.__lock:
             if sock not in self.__clients:
-                if strict:
-                    raise ValueError("the socket is not a client of this server")
                 return
             self.__closing.add(sock)
             if sock in self.__inputs:
                 self.__inputs.remove(sock)
             drained = not self.__pending.get(sock)
-            if not drained and sock not in self.__outputs:
-                self.__outputs.append(sock)
-        if drained:
+            if not drained:
+                if sock not in self.__outputs:
+                    self.__outputs.append(sock)
+                if timeout is not None:
+                    self.__deadlines[sock] = time.monotonic() + timeout
+        if drained and self.__in_poll_thread():
+            # Only the poll thread closes sockets: a close from another thread
+            # would leave its snapshot of the poll set with a dead descriptor.
             self.__close(sock)
+
+    def __in_poll_thread(self) -> bool:
+        """True when the caller may close sockets itself."""
+        return self.__runner is None or threading.get_ident() == self.__runner
 
     def __flush(self, sock: socket.socket) -> None:
         failure: Optional[OSError] = None
@@ -351,6 +482,9 @@ class SimpleSocketServer(EventBus):
                 self.__outputs.remove(sock)
             self.__pending.pop(sock, None)
             self.__closing.discard(sock)
+            self.__deadlines.pop(sock, None)
+            self.__failures.pop(sock, None)
+            self.__retired.add(sock)
         if peer is None:
             sock.close()
             return

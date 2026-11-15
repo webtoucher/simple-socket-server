@@ -22,7 +22,7 @@ $ pip install simple-socket-server
 Or you can add it as dependency in requirements.txt file of your python application:
 
 ```
-simple-socket-server~=2.1
+simple-socket-server~=2.2.0
 ```
 
 ## Usage
@@ -105,12 +105,12 @@ Handlers are called from the thread that runs `run()`, one at a time.
 
 ## API
 
-| Member                                   | Description                                                          |
-|------------------------------------------|----------------------------------------------------------------------|
-| `run(host='0.0.0.0', port=6666, max_conn=5, max_clients=500)` | serve connections until `stop()` is called      |
-| `stop()`                                 | ask `run()` to return; safe from a handler or another thread          |
-| `send(sock, message)`                    | queue `bytes` for a client; `ValueError` if it is not a client        |
-| `disconnect(sock)`                       | stop reading a client, deliver its queue, then close it               |
+| Member                                            | Description                                                          |
+|---------------------------------------------------|----------------------------------------------------------------------|
+| `run(host='0.0.0.0', port=6666, max_conn=SOMAXCONN, max_clients=500, max_pending=None)` | serve connections until `stop()` is called |
+| `stop()`                                          | ask `run()` to return; safe from a handler or another thread          |
+| `send(sock, message)`                             | queue `bytes` for a client; `ValueError` if it is not a client        |
+| `disconnect(sock, timeout=None)`                 | stop reading a client, deliver its queue, then close it; a second call is a no-op |
 | `is_running`                             | `True` while `run()` is serving connections                           |
 | `host`, `port`                           | the address the listening socket is bound to                          |
 | `on(event)`, `emit(...)`                 | inherited from `event_bus.EventBus`                                   |
@@ -127,14 +127,31 @@ Notes:
 - `send()` never blocks and never truncates: because client sockets are
   non-blocking, the bytes are buffered and the unwritten tail is retried on the
   next poll, so a message larger than the socket buffer arrives in full.
-- The outbound queue has no size limit: a client that stops reading grows the
-  buffer of the server until you disconnect it.
-- `send()` and `disconnect()` are safe to call from another thread. Delivery
-  happens during the next poll, so it can take up to the poll interval (0.1 s).
+- `max_pending` caps the outbound queue of one client, in bytes. When a client
+  stops reading and its queue grows past the cap, the server reports `error` on
+  it and closes it. The cap counts only the bytes still waiting to be written,
+  so a message that the socket accepts at once is delivered even when it is
+  larger than the cap. The default `None` means no cap, so a slow reader grows
+  the buffer until you disconnect it.
+- `disconnect(sock, timeout=...)` bounds the flush: when the timeout expires the
+  socket is closed with whatever is still queued. A client that stopped reading
+  never drains, so without a timeout the connection would live forever. Data
+  that is dropped this way is reported by no event — it is simply lost.
+- `stop()` does not flush the queues: it closes every socket as soon as the
+  current poll ends, so replies that are still queued are lost. Disconnect slow
+  clients with a timeout before calling `stop()` if those replies matter.
+- `send()` and `disconnect()` are safe to call from another thread. A `send()`
+  with an empty queue goes straight to the socket and does not wait for the next
+  poll; anything the socket does not take at once is queued. A `disconnect()`
+  from another thread only marks the client, and the thread of `run()` closes it
+  within the poll interval (0.1 s), so no handler ever runs outside it.
+- `disconnect()` is idempotent: repeating it for a client that is closed already
+  does nothing. A socket the server never served is a `ValueError`.
 - `max_conn` is the `listen()` backlog: how many connections the system queues
-  before `accept()`. It is not a limit of served clients. `max_clients` is that
-  limit: a connection above it is accepted, closed at once and reported through
-  `error`.
+  before `accept()`. It defaults to `socket.SOMAXCONN`; the previous default of 5
+  lost a part of a burst of simultaneous connections. It is not a limit of
+  served clients. `max_clients` is that limit: a connection above it is
+  accepted, closed at once and reported through `error`.
 - Do not call `sock.close()` yourself and do not use the socket after
   `disconnect` or `error`. Use `disconnect(sock)` instead: it stops reading the
   client and closes the socket after the queued replies are delivered. A socket
@@ -151,10 +168,12 @@ Notes:
   pyright see real signatures instead of `Any`.
 - Any server instance is independent: several servers may run in one process, each
   in its own thread.
-- The poll set of `select()` is limited by the platform: 512 descriptors on Windows
-  and 1024 elsewhere, the listening socket included. That is why concurrent clients
-  are capped by `max_clients`, 500 by default; a larger value makes `select()` fail,
-  and the server stops with an `error` event.
+- The poll set of `select()` is limited by the platform. On POSIX `select()`
+  rejects a descriptor number of 1024 or more, so a client that would exceed it
+  is closed with an `error` event, and a listening socket with such a number
+  fails `run()` with `SimpleSocketServerException` at startup. On Windows the
+  limit is the number of descriptors (512), which `max_clients` (500 by default)
+  stays below.
 
 ## Development
 
@@ -172,8 +191,14 @@ The test suite covers:
 - disconnects: graceful close by the peer, an abrupt reset and a send to a
   connection that is already gone,
 - error handling: `send()` and `disconnect()` for an unknown socket, a client limit
-  that is reached, and a port that is already taken (POSIX only: on Windows
-  `SO_REUSEADDR` allows rebinding a listening port),
+  that is reached, a rejected descriptor number, and a port that is already taken
+  (POSIX only: on Windows `SO_REUSEADDR` allows rebinding a listening port),
+- a burst: 200 clients connecting at the same moment with the default backlog,
+- threads: `send()` and `disconnect()` from another thread, the latency of a reply
+  from another thread and the thread every handler runs in,
+- `disconnect()` twice and after the peer is gone, a client dropped because its
+  outbound queue passed `max_pending`, and a drain that gives up on a client that
+  never reads,
 - a half-close: the peer sends, shuts down its writing side and still receives the
   whole reply, a 256 KiB one included,
 - server-driven disconnects: a queued reply reaches the client before the socket is

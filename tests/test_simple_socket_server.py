@@ -38,7 +38,7 @@ class RunningServer:
     def __init__(self, handlers=None, **run_kwargs):
         self.server = SimpleSocketServer()
         self.handlers = dict(handlers or {})
-        self.run_kwargs = {"host": LOCAL_HOST, "port": 0, "max_conn": 5}
+        self.run_kwargs = {"host": LOCAL_HOST, "port": 0}
         self.run_kwargs.update(run_kwargs)
         self.events = []
         self.error = None
@@ -467,6 +467,231 @@ def test_disconnect_rejects_a_foreign_socket(running_server):
             running_server.server.disconnect(stranger)
     finally:
         stranger.close()
+
+
+def test_disconnect_is_idempotent():
+    server = RunningServer().start()
+    try:
+        client = server.connect()
+        ((sock, _peer),) = server.wait_for("connect")
+        server.server.disconnect(sock)
+        server.server.disconnect(sock)  # the second call is silent
+        server.wait_for("disconnect")
+        client.settimeout(10)
+        assert client.recv(1) == b""
+
+        server.server.disconnect(sock)
+        assert len(server.events_of("disconnect")) == 1
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_disconnect_from_another_thread_keeps_the_server_alive():
+    clients = []
+    handler_threads = []
+
+    def on_connect(sock, _peer):
+        clients.append(sock)
+
+    def on_disconnect(_sock, _peer):
+        handler_threads.append(threading.get_ident())
+
+    server = RunningServer({"connect": on_connect, "disconnect": on_disconnect})
+    server.start()
+    poller = server.thread.ident
+    stop_churn = threading.Event()
+
+    def churn():
+        while not stop_churn.is_set():
+            try:
+                client = socket.create_connection(server.address, timeout=2)
+                time.sleep(0.005)
+                client.close()
+            except OSError:
+                return
+            # A short pause keeps the test from exhausting the ephemeral ports
+            # of the machine, which would make the following tests flaky.
+            time.sleep(0.01)
+
+    workers = [threading.Thread(target=churn, daemon=True) for _ in range(6)]
+    for worker in workers:
+        worker.start()
+    try:
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and server.thread.is_alive():
+            for sock in list(clients):
+                try:
+                    server.server.disconnect(sock)
+                except ValueError:
+                    pass
+            time.sleep(0.001)
+    finally:
+        stop_churn.set()
+        for worker in workers:
+            worker.join(5)
+
+    try:
+        assert server.thread.is_alive(), "run() survives a foreign-thread disconnect"
+        assert server.error is None, server.error
+        assert server.events_of("error") == []
+        assert handler_threads, "some connections were closed"
+        for ident in handler_threads:
+            assert ident == poller, "disconnect is emitted in the thread of run()"
+    finally:
+        server.stop()
+
+
+def test_send_from_another_thread_does_not_wait_for_the_poll():
+    ready = []
+    server = RunningServer({"connect": lambda sock, _peer: ready.append(sock)}).start()
+    try:
+        client = server.connect()
+        server.wait_for("connect")
+        sock = ready[0]
+        client.settimeout(10)
+        timings = []
+        for _ in range(20):
+            started = time.perf_counter()
+            server.server.send(sock, b"ping")
+            assert recv_exactly(client, 4, timeout=10) == b"ping"
+            timings.append(time.perf_counter() - started)
+        timings.sort()
+        median = timings[len(timings) // 2]
+        assert median < 0.010, "median delivery took %.1f ms" % (median * 1000)
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_a_descriptor_above_the_select_limit_is_rejected(monkeypatch):
+    server = RunningServer().start()
+    try:
+        monkeypatch.setattr(simple_socket_server, "_SELECT_FD_LIMIT", 0)
+        client = server.connect()
+        try:
+            (_sock, _peer, error), = server.wait_for("error")
+            assert isinstance(error, ConnectionAbortedError)
+            assert server.thread.is_alive(), "one rejected client does not stop the loop"
+            assert server.events_of("connect") == []
+            client.settimeout(10)
+            assert client.recv(1) == b""
+        finally:
+            client.close()
+    finally:
+        server.stop()
+
+
+def test_a_listening_descriptor_above_the_select_limit_fails_loudly(monkeypatch):
+    monkeypatch.setattr(simple_socket_server, "_SELECT_FD_LIMIT", 0)
+    server = SimpleSocketServer()
+    with pytest.raises(SimpleSocketServerException):
+        server.run(host=LOCAL_HOST, port=0)
+    assert not server.is_running
+
+
+def test_a_slow_client_is_dropped_when_the_queue_limit_is_reached():
+    ready = []
+    server = RunningServer(
+        {"connect": lambda sock, _peer: ready.append(sock)},
+        max_pending=4096,
+    ).start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Small buffers on both ends: otherwise the kernel swallows megabytes of
+        # replies for a client that never reads, and the queue never grows.
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.settimeout(30)
+        client.connect(server.address)
+        ((sock, _peer),) = server.wait_for("connect")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+        payload = b"x" * 65536
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not server.events_of("error"):
+            try:
+                server.server.send(sock, payload)
+            except ValueError:
+                break
+
+        (_sock, _peer, error), = server.wait_for("error")
+        assert isinstance(error, ConnectionAbortedError)
+        assert server.thread.is_alive(), "a slow client does not stop the loop"
+        server.wait_for("disconnect")
+        while client.recv(65536):
+            pass
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_disconnect_gives_up_when_the_client_does_not_read():
+    ready = []
+    server = RunningServer({"connect": lambda sock, _peer: ready.append(sock)}).start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.settimeout(30)
+        client.connect(server.address)
+        ((sock, _peer),) = server.wait_for("connect")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+        # A client that never reads leaves the queue growing: the loop fills it
+        # past the socket buffers, and without a timeout it would never drain.
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(64):
+            server.server.send(sock, chunk)
+        server.server.disconnect(sock, timeout=0.2)
+
+        started = time.monotonic()
+        server.wait_for("disconnect", timeout=5)
+        assert time.monotonic() - started < 5, "the drain gave up in time"
+        assert server.thread.is_alive()
+        assert server.error is None, server.error
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_two_hundred_clients_are_accepted_with_the_default_backlog():
+    clients = 200
+
+    def on_message(sock, _peer, _data):
+        state["server"].send(sock, b"ok")
+
+    state = {}
+    server = RunningServer({"message": on_message})
+    state["server"] = server.server
+    server.start()
+    barrier = threading.Barrier(clients)
+    replies = []
+    lock = threading.Lock()
+
+    def talk():
+        barrier.wait(30)
+        try:
+            client = server.connect(timeout=20)
+            try:
+                client.sendall(b"x")
+                reply = recv_exactly(client, 2, timeout=20)
+            finally:
+                client.close()
+        except OSError as error:
+            reply = error
+        with lock:
+            replies.append(reply)
+
+    workers = [threading.Thread(target=talk) for _ in range(clients)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60)
+        failures = [reply for reply in replies if reply != b"ok"]
+        assert not failures, "%d of %d clients got no reply: %r" % (
+            len(failures), clients, failures[:3])
+    finally:
+        server.stop()
 
 
 def test_closing_the_socket_inside_a_handler_keeps_the_server_alive():

@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-15
+
+### Added
+
+- `max_pending` argument of `run()`: a cap of the outbound queue of one client, in
+  bytes. A slow reader that grows past the cap is reported through `error` and
+  closed instead of growing the memory of the server without a bound.
+- `timeout` argument of `disconnect()`: how long the queue may still be flushed, in
+  seconds. A client that stopped reading used to keep the connection forever,
+  because the queue never drained; once the timeout expires the socket is closed
+  with whatever is left unsent.
+- Tests for the new behaviour: 200 clients connecting at once, `send()` and
+  `disconnect()` from another thread, the latency of such a reply, the thread every
+  handler runs in, a repeated `disconnect()`, a rejected descriptor number and a
+  client dropped by `max_pending`.
+
+### Fixed
+
+- `disconnect()` called from another thread could stop the whole server with
+  `OSError` (`Bad file descriptor` / `WSAENOTSOCK`): the foreign thread closed the
+  socket between the snapshot of the poll set and `select()`. Sockets are closed
+  only by the thread of `run()` now, so a foreign `disconnect()` just marks the
+  client and the poll thread finishes it. As a side effect, `disconnect` is emitted
+  in the thread of `run()`, as the documentation promises.
+- The default backlog of `listen()` was 5, so a burst of simultaneous connections
+  lost a part of them: 185 of 200 clients were served. It is `socket.SOMAXCONN`
+  now, and all 200 clients of the test get their reply.
+- A reply queued from another thread waited for the next poll: the median was
+  100 ms, the whole poll interval. An empty queue is written straight to the socket
+  now, and only the unwritten tail is queued, so the median drops below a
+  millisecond.
+- `disconnect()` for a client that is already closed raised `ValueError`, which a
+  race with the peer or with the poll thread makes unavoidable. It is idempotent
+  now; an unknown socket still raises.
+- On POSIX a descriptor number of 1024 or more made `select()` fail with
+  `ValueError`, and the number is not a count, so `max_clients` did not cover it: a
+  process holding many files stopped the server. An accepted client above the
+  limit is closed with `error`, and a listening socket above it fails `run()` with
+  `SimpleSocketServerException` instead of a bare `ValueError`.
+
+### Changed
+
+- `max_conn` defaults to `socket.SOMAXCONN` instead of 5. It is still the backlog
+  of `listen()`, not a limit of served clients; `max_clients` limits those.
+- Documentation: the thread rules of `send()` and `disconnect()`, the idempotent
+  `disconnect()`, `max_pending` and the descriptor limit of `select()` are spelled
+  out. It also says that `max_pending` counts only the bytes still waiting to be
+  written and that `stop()` does not flush the queues.
+- Version numbers carry three components from this release on: `2.2.0` instead of
+  `2.2`.
+
 ## [2.1] - 2026-11-15
 
 ### Added
