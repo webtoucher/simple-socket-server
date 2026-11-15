@@ -22,7 +22,7 @@ $ pip install simple-socket-server
 Or you can add it as dependency in requirements.txt file of your python application:
 
 ```
-simple-socket-server~=2.0
+simple-socket-server~=2.1
 ```
 
 ## Usage
@@ -90,40 +90,57 @@ print(socket_server.host, socket_server.port)
 
 Handlers are called from the thread that runs `run()`, one at a time.
 
-| Event        | Arguments               | When it fires                                                    |
-|--------------|-------------------------|------------------------------------------------------------------|
-| `start`      | `host, port`            | the listening socket is ready                                    |
-| `connect`    | `sock, peer`            | a client has been accepted                                       |
-| `message`    | `sock, peer, data`      | a chunk of bytes has been received                               |
-| `disconnect` | `sock, peer`            | the connection is gone; the socket is closed right after         |
-| `error`      | `sock, peer, error`     | a socket error occurred; `disconnect` follows                    |
-| `stop`       | `host, port`            | `run()` has returned and every socket is closed                  |
+| Event        | Arguments               | When it fires                                                             |
+|--------------|-------------------------|---------------------------------------------------------------------------|
+| `start`      | `host, port`            | the listening socket is ready                                             |
+| `connect`    | `sock, peer`            | a client has been accepted                                                |
+| `message`    | `sock, peer, data`      | a chunk of bytes has been received                                        |
+| `disconnect` | `sock, peer`            | the connection is closed; the replies queued for it were delivered first   |
+| `error`      | `sock, peer, error`     | a socket error occurred; the connection is closed and `disconnect` follows |
+| `stop`       | `host, port`            | `run()` has returned and every socket is closed                            |
 
-`peer` is an `(host, port)` tuple, `data` is `bytes`, `error` is an `OSError`.
+`peer` is an `(host, port)` tuple, `data` is `bytes`, `error` is an `OSError`. When
+`error` reports a failure of the listening socket or of `select()` itself, `peer` is
+`None` and the server stops.
 
 ## API
 
-| Member                                | Description                                                          |
-|---------------------------------------|----------------------------------------------------------------------|
-| `run(host='0.0.0.0', port=6666, max_conn=5)` | serve connections until `stop()` is called                    |
-| `stop()`                              | ask `run()` to return; safe from a handler or another thread          |
-| `send(sock, message)`                 | queue `bytes` for a client; `ValueError` if it is not a client        |
-| `is_running`                          | `True` while `run()` is serving connections                           |
-| `host`, `port`                        | the address the listening socket is bound to                          |
-| `on(event)`, `emit(...)`              | inherited from `event_bus.EventBus`                                   |
+| Member                                   | Description                                                          |
+|------------------------------------------|----------------------------------------------------------------------|
+| `run(host='0.0.0.0', port=6666, max_conn=5, max_clients=500)` | serve connections until `stop()` is called      |
+| `stop()`                                 | ask `run()` to return; safe from a handler or another thread          |
+| `send(sock, message)`                    | queue `bytes` for a client; `ValueError` if it is not a client        |
+| `disconnect(sock)`                       | stop reading a client, deliver its queue, then close it               |
+| `is_running`                             | `True` while `run()` is serving connections                           |
+| `host`, `port`                           | the address the listening socket is bound to                          |
+| `on(event)`, `emit(...)`                 | inherited from `event_bus.EventBus`                                   |
 
 Notes:
 
 - The server is single-threaded and handlers are called synchronously, so a slow
   handler delays every other connection. Hand off long work to your own thread.
+- **A handler must not raise.** The exception propagates out of `run()` and stops
+  the server for every client; the sockets are still closed before the call returns.
+  If one connection misbehaves, handle it in the handler and call `disconnect()`.
 - `message` carries one raw `recv()` chunk of up to 1024 bytes. There is no
   framing: the protocol you put on top has to delimit its own messages.
 - `send()` never blocks and never truncates: because client sockets are
   non-blocking, the bytes are buffered and the unwritten tail is retried on the
   next poll, so a message larger than the socket buffer arrives in full.
-- Do not use the socket after `disconnect` or `error`: it is closed.
-- An exception raised by a handler propagates out of `run()`. The socket state is
-  still cleaned up before the call returns.
+- The outbound queue has no size limit: a client that stops reading grows the
+  buffer of the server until you disconnect it.
+- `send()` and `disconnect()` are safe to call from another thread. Delivery
+  happens during the next poll, so it can take up to the poll interval (0.1 s).
+- `max_conn` is the `listen()` backlog: how many connections the system queues
+  before `accept()`. It is not a limit of served clients. `max_clients` is that
+  limit: a connection above it is accepted, closed at once and reported through
+  `error`.
+- Do not call `sock.close()` yourself and do not use the socket after
+  `disconnect` or `error`. Use `disconnect(sock)` instead: it stops reading the
+  client and closes the socket after the queued replies are delivered. A socket
+  closed behind the server's back is dropped on the next poll, without delivery.
+- Urgent (out of band) data is not supported, and such data is not treated as an
+  error: the bytes stay in the stream and arrive through `message`.
 
 ## Compatibility
 
@@ -134,6 +151,10 @@ Notes:
   pyright see real signatures instead of `Any`.
 - Any server instance is independent: several servers may run in one process, each
   in its own thread.
+- The poll set of `select()` is limited by the platform: 512 descriptors on Windows
+  and 1024 elsewhere, the listening socket included. That is why concurrent clients
+  are capped by `max_clients`, 500 by default; a larger value makes `select()` fail,
+  and the server stops with an `error` event.
 
 ## Development
 
@@ -150,7 +171,16 @@ The test suite covers:
 - the message flow: `connect`, echo round trips, ordering and large payloads,
 - disconnects: graceful close by the peer, an abrupt reset and a send to a
   connection that is already gone,
-- error handling: an unknown socket for `send()` and a port that is already taken,
+- error handling: `send()` and `disconnect()` for an unknown socket, a client limit
+  that is reached, and a port that is already taken (POSIX only: on Windows
+  `SO_REUSEADDR` allows rebinding a listening port),
+- a half-close: the peer sends, shuts down its writing side and still receives the
+  whole reply, a 256 KiB one included,
+- server-driven disconnects: a queued reply reaches the client before the socket is
+  closed,
+- resilience: a handler that closes its socket does not stop the server, and
+  `stop()` closes every client and emits `stop` even if a `disconnect` handler
+  raises,
 - independence of two servers running in one process.
 
 Project layout:

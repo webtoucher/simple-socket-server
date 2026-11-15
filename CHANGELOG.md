@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1] - 2026-11-15
+
+### Added
+
+- `disconnect(sock)`: a graceful way to drop a client from a handler or from
+  another thread. The socket stops being read, the replies already queued for it
+  are delivered, and only then it is closed and `disconnect` is emitted.
+- `max_clients` argument of `run()` (500 by default): a connection above the limit
+  is accepted, closed at once and reported through the `error` event.
+- Tests for the new behaviour: a client half-close, a queued reply delivered before
+  the close, a socket closed inside a handler, a failing `disconnect` handler
+  during `stop()`, the client limit and a port that is already taken.
+
+### Fixed
+
+- `select()` could kill the server with `ValueError`. A socket closed behind the
+  server's back left the poll set with a dead descriptor (`file descriptor cannot
+  be a negative integer`), and an oversized client set failed the same way
+  (`filedescriptor out of range`). Dead sockets are dropped before the poll,
+  failures of `select()` are reported through `error` and stop the server instead
+  of escaping `run()`, and the number of clients is capped below `FD_SETSIZE`.
+- The reply to a client that half-closed the connection (`sendall()` followed by
+  `shutdown(SHUT_WR)`, the way `nc -N` behaves) was thrown away. A connection that
+  ended its input keeps being written to until its queue is drained.
+- `stop()` could leave clients open and the port listening when a `disconnect`
+  handler raised. The listening socket is closed first, every client is closed in
+  its own `try`, and `stop` is emitted in any case; the first handler failure is
+  re-raised afterwards.
+- `send()` called from another thread mutated the poll state without a lock. The
+  queues and the poll sets are guarded by a lock now, and handlers are never called
+  under it.
+- Urgent (out of band) data disconnected the client without an `error` event. Only
+  the listening socket is passed to the exceptional set of `select()`.
+- A `BlockingIOError` of `accept()` was reported as an `error` event. It is ignored
+  now, any other `accept()` failure pauses before the next attempt, so a descriptor
+  shortage does not spin the loop.
+
+### Changed
+
+- A `disconnect` handler that raises no longer aborts the cleanup: `run()` closes
+  every socket and emits `stop` before the exception surfaces.
+- `error` for a failed `select()` or a broken listening socket reports the listening
+  socket and `peer=None`; for a rejected connection it reports the client socket
+  and its address.
+- Concurrent clients are limited to 500 by default. A larger `max_clients` can
+  exceed the descriptor limit of `select()` (512 on Windows), which stops the server
+  with an `error` event.
+- The version test reads the package metadata instead of a hard-coded version.
+- Documentation: `max_conn` is described as the `listen()` backlog and `max_clients`
+  as the limit of concurrent clients; the thread safety of `send()` and
+  `disconnect()`, the unbounded outbound queue, the `select()` descriptor limit and
+  the rule that a handler must not raise are spelled out.
+
 ## [2.0] - 2026-11-15
 
 ### Added

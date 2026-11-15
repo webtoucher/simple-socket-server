@@ -1,6 +1,8 @@
 """Tests for the simple_socket_server package."""
 
+import importlib.metadata
 import os
+import re
 import socket
 import struct
 import threading
@@ -39,6 +41,7 @@ class RunningServer:
         self.run_kwargs = {"host": LOCAL_HOST, "port": 0, "max_conn": 5}
         self.run_kwargs.update(run_kwargs)
         self.events = []
+        self.error = None
         self._lock = threading.Lock()
         self._started = threading.Event()
         self._finished = threading.Event()
@@ -56,6 +59,8 @@ class RunningServer:
     def _run(self):
         try:
             self.server.run(**self.run_kwargs)
+        except BaseException as error:  # noqa: BLE001 - kept for the assertions
+            self.error = error
         finally:
             self._finished.set()
 
@@ -341,5 +346,172 @@ def test_public_api_is_explicit():
     for name in simple_socket_server.__all__:
         assert not name.startswith("_"), "%s is not a public name" % name
         assert hasattr(simple_socket_server, name), "%s is in __all__ but missing" % name
-    assert simple_socket_server.__version__ == "2.0"
+    assert re.match(r"^\d+\.\d+(\.\d+)?$", simple_socket_server.__version__)
     assert issubclass(SimpleSocketServerException, OSError)
+
+
+def test_declared_version_matches_the_package_metadata():
+    try:
+        installed = importlib.metadata.version("simple-socket-server")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("the package is not installed, metadata is unavailable")
+    assert installed == simple_socket_server.__version__
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="SO_REUSEADDR lets Windows bind a port that is already listening",
+)
+def test_taken_port_raises_server_exception():
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind((LOCAL_HOST, 0))
+    blocker.listen(1)
+    try:
+        server = SimpleSocketServer()
+        with pytest.raises(SimpleSocketServerException):
+            server.run(host=LOCAL_HOST, port=blocker.getsockname()[1])
+        assert not server.is_running
+    finally:
+        blocker.close()
+
+
+def test_client_limit_is_reported_through_the_error_event():
+    server = RunningServer(max_clients=1).start()
+    try:
+        first = server.connect()
+        second = server.connect()
+        try:
+            (_sock, _peer, error), = server.wait_for("error")
+            assert isinstance(error, ConnectionAbortedError)
+            assert server.thread.is_alive(), "one excessive client does not stop the loop"
+            second.settimeout(10)
+            assert second.recv(1) == b"", "the excessive client is closed at once"
+            assert len(server.events_of("connect")) == 1
+        finally:
+            first.close()
+            second.close()
+    finally:
+        server.stop()
+
+
+def half_close_client(server, request, timeout=10.0):
+    """Send a request, close the write half and read the reply until EOF."""
+    client = server.connect()
+    try:
+        client.sendall(request)
+        client.shutdown(socket.SHUT_WR)
+        client.settimeout(timeout)
+        reply = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                return reply
+            reply += chunk
+    finally:
+        client.close()
+
+
+def test_reply_survives_a_half_close_of_the_client():
+    def on_message(sock, _peer, data):
+        state["server"].send(sock, b"echo:" + data)
+
+    state = {}
+    server = RunningServer({"message": on_message})
+    state["server"] = server.server
+    server.start()
+    try:
+        # The reply used to be dropped whenever the EOF arrived before the flush.
+        for attempt in range(10):
+            reply = half_close_client(server, b"ping")
+            assert reply == b"echo:ping", "attempt %d lost the reply" % attempt
+    finally:
+        server.stop()
+
+
+def test_large_reply_survives_a_half_close_of_the_client():
+    payload = bytes(range(256)) * 1024  # 256 KiB, far above the socket buffer
+
+    def on_message(sock, _peer, _data):
+        state["server"].send(sock, payload)
+
+    state = {}
+    server = RunningServer({"message": on_message})
+    state["server"] = server.server
+    server.start()
+    try:
+        assert half_close_client(server, b"go", timeout=30) == payload
+    finally:
+        server.stop()
+
+
+def test_disconnect_delivers_the_queue_before_it_closes():
+    def on_message(sock, _peer, _data):
+        state["server"].send(sock, b"bye")
+        state["server"].disconnect(sock)
+
+    state = {}
+    server = RunningServer({"message": on_message})
+    state["server"] = server.server
+    server.start()
+    try:
+        assert half_close_client(server, b"go") == b"bye"
+        server.wait_for("disconnect")
+    finally:
+        server.stop()
+
+
+def test_disconnect_rejects_a_foreign_socket(running_server):
+    stranger = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(ValueError):
+            running_server.server.disconnect(stranger)
+    finally:
+        stranger.close()
+
+
+def test_closing_the_socket_inside_a_handler_keeps_the_server_alive():
+    def on_message(sock, _peer, _data):
+        sock.close()
+
+    server = RunningServer({"message": on_message}).start()
+    try:
+        victim = server.connect()
+        server.wait_for("connect")
+        victim.sendall(b"x")
+        server.wait_for("disconnect")
+
+        assert server.thread.is_alive(), "run() survived a socket closed by a handler"
+        assert server.error is None, server.error
+
+        second = server.connect()
+        try:
+            server.wait_for("connect", count=2)
+            assert server.thread.is_alive()
+        finally:
+            victim.close()
+            second.close()
+    finally:
+        server.stop()
+
+
+def test_stop_closes_everything_even_if_a_disconnect_handler_raises():
+    def bad_disconnect(_sock, _peer):
+        raise RuntimeError("boom on disconnect")
+
+    server = RunningServer({"disconnect": bad_disconnect}).start()
+    first = server.connect()
+    second = server.connect()
+    server.wait_for("connect", count=2)
+
+    server.stop()
+
+    assert server.events_of("stop"), "the stop event arrives despite the failure"
+    assert isinstance(server.error, RuntimeError), "the handler failure is not swallowed"
+    first.settimeout(10)
+    second.settimeout(10)
+    assert first.recv(1) == b"", "every client is closed"
+    assert second.recv(1) == b"", "every client is closed, not just the first one"
+    first.close()
+    second.close()
+    with pytest.raises(OSError):
+        socket.create_connection(server.address, timeout=2)
